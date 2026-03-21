@@ -6,6 +6,7 @@ set -euo pipefail
 
 CONTAINER="${1:-voice-dictation-test}"
 IMAGE="ubuntu:24.04"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -73,35 +74,59 @@ info "Cloning voice-dictation repo..."
 $LXC exec "$CONTAINER" -- su - testuser -c \
     "git clone https://github.com/cccl-ai/voice-dictation.git ~/voice-dictation"
 
-# Run install with 'local' backend (no API key needed) and skip interactive prompts
+# Pre-configure backend and enable lingering (avoid interactive prompts)
+info "Pre-configuring container for non-interactive install..."
+$LXC exec "$CONTAINER" -- bash -c "loginctl enable-linger testuser 2>/dev/null || true"
+$LXC exec "$CONTAINER" -- su - testuser -c "mkdir -p ~/.config/dictation ~/.config/groq"
+$LXC exec "$CONTAINER" -- su - testuser -c "echo local > ~/.config/dictation/backend"
+
+# Push a patched install script that skips interactive backend setup
+# We do this by pushing a wrapper from the host to avoid quoting hell
+cat > /tmp/voice-dictation-ci-install.sh << 'CIEOF'
+#!/bin/bash
+cd ~/voice-dictation
+
+# Patch install.sh for non-interactive container use:
+# 1. Remove setup_backend calls (backend pre-configured)
+# 2. Make systemctl calls non-fatal (no user session bus in container)
+# 3. Remove set -e (some commands are expected to fail in container)
+sed -e '/^    setup_backend$/d' \
+    -e 's/^set -e$/set +e/' \
+    -e 's/systemctl --user daemon-reload/systemctl --user daemon-reload 2>\/dev\/null || true/' \
+    -e 's/systemctl --user enable dictation/systemctl --user enable dictation/; s/dictation-listener$/dictation-listener 2>\/dev\/null || true/' \
+    -e 's/systemctl --user restart dictation/systemctl --user restart dictation/; s/dictation-listener$/dictation-listener 2>\/dev\/null || true/' \
+    install.sh > /tmp/install-patched.sh
+chmod +x /tmp/install-patched.sh
+
+# Ensure XDG_RUNTIME_DIR is set for systemd --user
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+# Start dbus session if available (needed for systemctl --user)
+if command -v dbus-launch &>/dev/null; then
+    eval "$(dbus-launch --sh-syntax)" 2>/dev/null || true
+fi
+
+bash /tmp/install-patched.sh
+CIEOF
+
+$LXC file push /tmp/voice-dictation-ci-install.sh "$CONTAINER/home/testuser/ci-install.sh"
+$LXC exec "$CONTAINER" -- chown testuser:testuser /home/testuser/ci-install.sh
+$LXC exec "$CONTAINER" -- chmod +x /home/testuser/ci-install.sh
+
+# Run install
 info "Running install.sh (local backend, non-interactive)..."
-$LXC exec "$CONTAINER" -- su - testuser -c "
-    mkdir -p ~/.config/dictation ~/.config/groq
-    echo 'local' > ~/.config/dictation/backend
-    cd ~/voice-dictation
-
-    # Patch install.sh to skip interactive prompts (backend already configured)
-    sed 's/setup_backend/info \"Backend pre-configured as local\"/' install.sh > install-ci.sh
-    chmod +x install-ci.sh
-
-    # Enable lingering for systemd user services without login session
-    sudo loginctl enable-linger testuser
-
-    # Need XDG_RUNTIME_DIR for systemd --user
-    export XDG_RUNTIME_DIR=/run/user/\$(id -u)
-    mkdir -p \$XDG_RUNTIME_DIR || true
-
-    bash install-ci.sh 2>&1
-" || warn "Install had issues (expected in container — no audio hardware)"
+$LXC exec "$CONTAINER" -- su - testuser -c \
+    "export XDG_RUNTIME_DIR=/run/user/\$(id -u) && bash ~/ci-install.sh 2>&1" \
+    || warn "Install had issues (expected in container — no audio hardware)"
 
 # Run the test script
 info "Running test.sh..."
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-$LXC exec "$CONTAINER" -- su - testuser -c "
-    export XDG_RUNTIME_DIR=/run/user/\$(id -u)
-    cd ~/voice-dictation && bash test.sh 2>&1
-" || true
+$LXC exec "$CONTAINER" -- su - testuser -c \
+    "export XDG_RUNTIME_DIR=/run/user/\$(id -u) && cd ~/voice-dictation && bash test.sh 2>&1" \
+    || true
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 echo ""

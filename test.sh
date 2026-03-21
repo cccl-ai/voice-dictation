@@ -1,7 +1,7 @@
 #!/bin/bash
 # Voice Dictation - Installation Verification Script
 # Run after install.sh to verify everything is set up correctly
-set -euo pipefail
+set +e  # Don't exit on failures — this script checks for them
 
 # Colors
 RED='\033[0;31m'
