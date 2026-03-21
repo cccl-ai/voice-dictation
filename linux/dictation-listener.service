@@ -1,0 +1,11 @@
+[Unit]
+Description=Dictation Hotkey Listener (Ctrl+Shift+Space)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/dictation-listener
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

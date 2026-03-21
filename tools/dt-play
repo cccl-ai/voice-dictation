@@ -1,0 +1,21 @@
+#!/bin/bash
+# Play recent dictation recordings
+# Usage: dt play [N] — play Nth most recent recording (default: 1)
+
+DICTATION_HISTORY_DIR="$HOME/.local/share/dictation-history"
+N="${1:-1}"
+
+wav=$(ls -t "$DICTATION_HISTORY_DIR"/*.wav 2>/dev/null | sed -n "${N}p")
+
+if [ -z "$wav" ] || [ ! -f "$wav" ]; then
+    echo "No recording found at position $N"
+    exit 1
+fi
+
+name=$(basename "$wav" .txt)
+txt="${wav%.wav}.txt"
+
+echo -e "\033[0;36m$(basename "$wav")\033[0m"
+[ -f "$txt" ] && echo -e "\033[2m$(cat "$txt")\033[0m"
+echo ""
+play -q "$wav" highpass 400 highpass 400 lowpass 3000 lowpass 3000 compand 0.3,1 6:-70,-60,-20 -5 -90 0.2 gain 5 2>/dev/null

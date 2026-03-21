@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+import tkinter as tk
+import subprocess
+
+# Get current mouse position to determine which monitor
+try:
+    result = subprocess.run(['xdotool', 'getmouselocation'], capture_output=True, text=True)
+    mouse_data = result.stdout.strip()
+    parts = mouse_data.split()
+    mouse_x = int(parts[0].split(':')[1])
+    mouse_y = int(parts[1].split(':')[1])
+except:
+    mouse_x = 0
+    mouse_y = 0
+
+# Create transparent overlay window
+root = tk.Tk()
+root.attributes('-type', 'splash')
+root.attributes('-alpha', 1.0)
+
+# Dark transparent background
+root.configure(bg='#1a1a1a')
+
+# Container frame
+frame = tk.Frame(root, bg='#1a1a1a')
+frame.pack(expand=True, fill='both', padx=30, pady=25)
+
+# Red circle using Canvas (smooth rounded circle)
+canvas = tk.Canvas(frame, width=80, height=80, bg='#1a1a1a', highlightthickness=0)
+canvas.pack()
+canvas.create_oval(10, 10, 70, 70, fill='#ff5555', outline='#ff5555')
+
+# Recording text
+label = tk.Label(
+    frame,
+    text='RECORDING',
+    font=('Helvetica', 24, 'bold'),
+    fg='#ffffff',
+    bg='#1a1a1a'
+)
+label.pack(pady=(10, 0))
+
+# Subtitle
+subtitle = tk.Label(
+    frame,
+    text='Dictation Active',
+    font=('Helvetica', 12),
+    fg='#aaaaaa',
+    bg='#1a1a1a'
+)
+subtitle.pack()
+
+# Close on any click or key press
+def close_window(event=None):
+    root.quit()
+
+root.bind('<Button-1>', close_window)
+root.bind('<Escape>', close_window)
+root.bind('<q>', close_window)
+
+# Keep window on top
+root.attributes('-topmost', True)
+
+root.update_idletasks()
+window_width = root.winfo_width()
+window_height = root.winfo_height()
+
+# Position near the mouse
+x = mouse_x - window_width // 2
+y = mouse_y - 120
+
+root.geometry(f'{window_width}x{window_height}+{x}+{y}')
+
+root.mainloop()

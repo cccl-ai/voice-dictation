@@ -1,0 +1,285 @@
+#!/bin/bash
+# Voice Dictation Daemon
+# Daemon-based architecture for instant response
+# Uses sox for recording, whisper.cpp for transcription, ydotool for typing
+
+# Auto-detect Xwayland auth file for overlay (changes on every login)
+if [ -z "$XAUTHORITY" ]; then
+    XAUTHORITY=$(ls -t /run/user/$(id -u)/.mutter-Xwaylandauth.* 2>/dev/null | head -1)
+    export XAUTHORITY
+fi
+
+CONTROL_FILE="/tmp/dictation_control"
+RECORDING_FILE="/tmp/dictation_recording.wav"
+PID_FILE="/tmp/dictation.pid"
+DAEMON_PID="/tmp/dictation_daemon.pid"
+NOTIFY_ID_FILE="/tmp/dictation_notify.id"
+
+# Transcription backend: "groq" or "local"
+# Override with env var or config file
+TRANSCRIPTION_BACKEND="${TRANSCRIPTION_BACKEND:-$(cat "$HOME/.config/dictation/backend" 2>/dev/null)}"
+TRANSCRIPTION_BACKEND="${TRANSCRIPTION_BACKEND:-groq}"
+
+# Local whisper config
+WHISPER_MODEL="$HOME/tools/whisper-models/ggml-base.bin"
+WHISPER_CLI="${HOME}/tools/whisper.cpp/build/bin/whisper-cli"
+
+# Groq cloud config
+GROQ_API_KEY=$(cat "$HOME/.config/groq/api_key" 2>/dev/null)
+GROQ_MODEL="whisper-large-v3"
+GROQ_PROMPT_FILE="$HOME/.config/groq/prompt_hints"
+
+# Configuration - can override with env vars
+WORD_BY_WORD="${WORD_BY_WORD:-false}"  # Set to true for word-by-word typing
+START_SOUND="${START_SOUND:-/usr/share/sounds/freedesktop/stereo/message.oga}"
+DONE_SOUND="${DONE_SOUND:-/usr/share/sounds/freedesktop/stereo/complete.oga}"
+SOUND_VOLUME="${SOUND_VOLUME:-50}"  # Volume percentage (0-100), default 50%
+MAX_RECORDING_TIME=180  # 3 minutes timeout
+RECORDING_START_TIME=""
+
+# History: save recordings and transcripts for replay/debugging
+DICTATION_HISTORY_DIR="$HOME/.local/share/dictation-history"
+mkdir -p "$DICTATION_HISTORY_DIR"
+
+# Convert percentage to paplay scale (65536 = 100%)
+PAPLAY_VOLUME=$((SOUND_VOLUME * 65536 / 100))
+
+# Kill any existing daemon instance
+if [ -f "$DAEMON_PID" ]; then
+    OLD_PID=$(cat "$DAEMON_PID")
+    if [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[$(date +'%H:%M:%S')] Killing existing daemon (PID: $OLD_PID)" >&2
+        kill "$OLD_PID" 2>/dev/null
+        sleep 1
+    fi
+fi
+
+# Save daemon PID
+echo $$ > "$DAEMON_PID"
+
+log() {
+    echo "[$(date +'%H:%M:%S')] $1" >&2
+}
+
+dismiss_notification() {
+    if [ -f "$NOTIFY_ID_FILE" ]; then
+        OVERLAY_PID=$(cat "$NOTIFY_ID_FILE")
+        kill $OVERLAY_PID 2>/dev/null
+        rm -f "$NOTIFY_ID_FILE"
+    fi
+}
+
+transcribe() {
+    local audio_file="$1"
+    if [ "$TRANSCRIPTION_BACKEND" = "local" ]; then
+        PROMPT_HINT=$(cat "$GROQ_PROMPT_FILE" 2>/dev/null)
+        LOCAL_ARGS=(-m "$WHISPER_MODEL" -f "$audio_file" --no-timestamps -nt -l en)
+        [ -n "$PROMPT_HINT" ] && LOCAL_ARGS+=(--prompt "$PROMPT_HINT")
+        "$WHISPER_CLI" "${LOCAL_ARGS[@]}" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    else
+        PROMPT_HINT=$(cat "$GROQ_PROMPT_FILE" 2>/dev/null)
+        CURL_ARGS=(-s https://api.groq.com/openai/v1/audio/transcriptions \
+            -H "Authorization: Bearer $GROQ_API_KEY" \
+            -F file="@$audio_file" \
+            -F model="$GROQ_MODEL" \
+            -F response_format="text" \
+            -F language="en")
+        [ -n "$PROMPT_HINT" ] && CURL_ARGS+=(-F "prompt=$PROMPT_HINT")
+        curl "${CURL_ARGS[@]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    fi
+}
+
+log "Dictation daemon started (PID: $$)"
+log "Watching for control signals at: $CONTROL_FILE"
+log "Transcription backend: $TRANSCRIPTION_BACKEND"
+[ "$TRANSCRIPTION_BACKEND" = "groq" ] && log "Using Groq model: $GROQ_MODEL"
+[ "$TRANSCRIPTION_BACKEND" = "local" ] && log "Using local model: $WHISPER_MODEL"
+log "Word-by-word typing: $WORD_BY_WORD"
+log "Sound volume: $SOUND_VOLUME%"
+
+cleanup() {
+    log "Cleaning up and shutting down..."
+    # Dismiss notification if active
+    dismiss_notification
+    # Kill recording if active
+    if [ -f "$PID_FILE" ]; then
+        kill $(cat "$PID_FILE") 2>/dev/null
+    fi
+    rm -f "$CONTROL_FILE" "$PID_FILE" "$DAEMON_PID" "$RECORDING_FILE" "$NOTIFY_ID_FILE"
+    log "Daemon stopped"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+while true; do
+    # Wait for control signal
+    if [ -f "$CONTROL_FILE" ]; then
+        ACTION=$(cat "$CONTROL_FILE")
+        rm -f "$CONTROL_FILE"
+
+        if [ "$ACTION" = "start" ] && [ ! -f "$PID_FILE" ]; then
+            # Start recording with parecord (uses PipeWire)
+            log "Starting recording (3-minute timeout enabled)..."
+            RECORDING_START_TIME=$(date +%s)
+            parecord --channels=2 --rate=16000 --format=s16le "$RECORDING_FILE" &
+            echo $! > "$PID_FILE"
+            # Play start sound
+            paplay --volume="$PAPLAY_VOLUME" "$START_SOUND" 2>/dev/null &
+            # Show transparent overlay window
+            "$HOME/.local/bin/dictation-overlay" 2>/dev/null &
+            OVERLAY_PID=$!
+            echo $OVERLAY_PID > "$NOTIFY_ID_FILE"
+            log "Recording started, PID: $(cat $PID_FILE), Overlay PID: $OVERLAY_PID"
+
+        elif [ "$ACTION" = "stop" ] && [ -f "$PID_FILE" ]; then
+            # Stop recording (brief delay to capture trailing audio)
+            REC_PID=$(cat "$PID_FILE")
+            log "Stopping recording (PID: $REC_PID)..."
+            dismiss_notification
+            sleep 1
+            kill -INT $REC_PID 2>/dev/null
+            wait $REC_PID 2>/dev/null
+            rm -f "$PID_FILE"
+            RECORDING_START_TIME=""
+
+            # Transcribe
+            if [ -f "$RECORDING_FILE" ]; then
+                # Skip transcription if audio is too short (< 5KB ≈ near-empty file)
+                AUDIO_SIZE=$(stat -c%s "$RECORDING_FILE" 2>/dev/null || echo 0)
+                if [ "$AUDIO_SIZE" -lt 5000 ]; then
+                    log "Audio too short (${AUDIO_SIZE}b), skipping transcription"
+                    rm -f "$RECORDING_FILE"
+                    continue
+                fi
+                # Save recording to history
+                HIST_TS=$(date +'%Y-%m-%d_%H%M%S')
+                cp "$RECORDING_FILE" "$DICTATION_HISTORY_DIR/${HIST_TS}.wav"
+                log "Saved recording to $DICTATION_HISTORY_DIR/${HIST_TS}.wav"
+
+                log "Transcribing via $TRANSCRIPTION_BACKEND..."
+                TEXT=$(transcribe "$RECORDING_FILE")
+
+                # Save transcript to history
+                if [ -n "$TEXT" ]; then
+                    echo "$TEXT" > "$DICTATION_HISTORY_DIR/${HIST_TS}.txt"
+                fi
+
+                # Filter Whisper hallucinations
+                # 1. Known phrases on very short recordings (< 96KB ≈ 1.5s)
+                AUDIO_SIZE2=$(stat -c%s "$RECORDING_FILE" 2>/dev/null || echo 999999)
+                if [ "$AUDIO_SIZE2" -lt 96000 ]; then
+                    HALLUCINATIONS="thank you for watching|thanks for watching|thank you very much|thanks for listening|please subscribe|thank you$|you$"
+                    if echo "$TEXT" | grep -qiP "^\s*($HALLUCINATIONS)\s*\.?\s*$"; then
+                        log "Filtered Whisper hallucination (${AUDIO_SIZE2}b audio): $TEXT"
+                        TEXT=""
+                    fi
+                fi
+                # 2. Repetition loop detection (e.g. "and Qwen2.5.and Qwen2.5.and Qwen2.5.")
+                if [ -n "$TEXT" ] && echo "$TEXT" | grep -qP '(.{4,})\1{2,}'; then
+                    log "Filtered Whisper repetition loop: $TEXT"
+                    TEXT=""
+                fi
+                # 3. Prompt hint leakage (Whisper echoes terms from prompt hints on noise)
+                if [ -n "$TEXT" ] && echo "$TEXT" | grep -qiP '^\s*(and\s+)?Qwen\d*(\.\d+)?\s*\.?\s*$'; then
+                    log "Filtered prompt hint leakage: $TEXT"
+                    TEXT=""
+                fi
+
+                if [ -n "$TEXT" ]; then
+                    log "Transcribed: $TEXT"
+                    # Save current clipboard to restore later
+                    OLD_CLIP=$(wl-paste --no-newline 2>/dev/null || true)
+                    # Copy to clipboard using wl-copy --foreground so it stays alive
+                    # until another clipboard copy replaces it
+                    printf '%s' "$TEXT" | wl-copy --foreground &
+                    WL_COPY_PID=$!
+                    sleep 0.3
+                    /usr/local/bin/ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 2>/dev/null  # Ctrl+Shift+V
+                    sleep 0.5
+                    # wl-copy --foreground stays alive serving clipboard until replaced
+                    # Kill it after paste is done
+                    kill $WL_COPY_PID 2>/dev/null
+                    # Restore original clipboard
+                    if [ -n "$OLD_CLIP" ]; then
+                        printf '%s' "$OLD_CLIP" | wl-copy --foreground &
+                        WL_RESTORE_PID=$!
+                        # Let it serve the clipboard; it stays alive until next copy
+                    fi
+
+                    # Play done sound
+                    paplay --volume="$PAPLAY_VOLUME" "$DONE_SOUND" 2>/dev/null &
+                    log "Typing complete"
+                else
+                    log "No speech detected"
+                fi
+
+                rm -f "$RECORDING_FILE"
+            fi
+        fi
+    fi
+
+    # Check for recording timeout
+    if [ -f "$PID_FILE" ] && [ -n "$RECORDING_START_TIME" ]; then
+        CURRENT_TIME=$(date +%s)
+        ELAPSED=$((CURRENT_TIME - RECORDING_START_TIME))
+
+        if [ $ELAPSED -gt $MAX_RECORDING_TIME ]; then
+            log "Recording timeout reached ($ELAPSED seconds, max $MAX_RECORDING_TIME)"
+            REC_PID=$(cat "$PID_FILE")
+            log "Force stopping recording (PID: $REC_PID)..."
+            dismiss_notification
+            kill $REC_PID 2>/dev/null
+            rm -f "$PID_FILE"
+            RECORDING_START_TIME=""
+            sleep 0.3
+
+            # Transcribe
+            if [ -f "$RECORDING_FILE" ]; then
+                # Save recording to history
+                HIST_TS=$(date +'%Y-%m-%d_%H%M%S')
+                cp "$RECORDING_FILE" "$DICTATION_HISTORY_DIR/${HIST_TS}.wav"
+                log "Saved timeout recording to $DICTATION_HISTORY_DIR/${HIST_TS}.wav"
+
+                log "Transcribing timeout recording via $TRANSCRIPTION_BACKEND..."
+                TEXT=$(transcribe "$RECORDING_FILE")
+
+                # Save transcript to history
+                if [ -n "$TEXT" ]; then
+                    echo "$TEXT" > "$DICTATION_HISTORY_DIR/${HIST_TS}.txt"
+                fi
+
+                if [ -n "$TEXT" ]; then
+                    log "Transcribed: $TEXT"
+                    # Save current clipboard to restore later
+                    OLD_CLIP=$(wl-paste --no-newline 2>/dev/null || true)
+                    # Copy to clipboard using wl-copy --foreground so it stays alive
+                    # until another clipboard copy replaces it
+                    printf '%s' "$TEXT" | wl-copy --foreground &
+                    WL_COPY_PID=$!
+                    sleep 0.3
+                    /usr/local/bin/ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 2>/dev/null  # Ctrl+Shift+V
+                    sleep 0.5
+                    # wl-copy --foreground stays alive serving clipboard until replaced
+                    # Kill it after paste is done
+                    kill $WL_COPY_PID 2>/dev/null
+                    # Restore original clipboard
+                    if [ -n "$OLD_CLIP" ]; then
+                        printf '%s' "$OLD_CLIP" | wl-copy --foreground &
+                        WL_RESTORE_PID=$!
+                    fi
+
+                    # Play done sound
+                    paplay --volume="$PAPLAY_VOLUME" "$DONE_SOUND" 2>/dev/null &
+                    log "Typing complete"
+                else
+                    log "No speech detected in timeout recording"
+                fi
+
+                rm -f "$RECORDING_FILE"
+            fi
+        fi
+    fi
+
+    sleep 0.1
+done

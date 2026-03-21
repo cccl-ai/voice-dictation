@@ -1,0 +1,38 @@
+#!/bin/bash
+# List recent transcripts
+# Usage: dt list [N] — show last N transcripts (default: 5)
+
+DICTATION_HISTORY_DIR="$HOME/.local/share/dictation-history"
+
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    echo "Usage: dt list [N]"
+    echo "Show last N transcripts (default: 5)"
+    exit 0
+fi
+
+COUNT="${1:-5}"
+
+# Colors
+CYAN='\033[0;36m'
+DIM='\033[2m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+mapfile -t files < <(ls -t "$DICTATION_HISTORY_DIR"/*.txt 2>/dev/null | head -"$COUNT")
+
+if [ ${#files[@]} -eq 0 ]; then
+    echo "No transcripts found."
+    exit 0
+fi
+
+for txt in "${files[@]}"; do
+    name=$(basename "$txt" .txt)
+    date="${name%%_*}"
+    time="${name##*_}"
+    time_fmt="${time:0:2}:${time:2:2}"
+    content=$(cat "$txt")
+    words=$(echo "$content" | wc -w)
+    echo -e "${CYAN}${date} ${time_fmt}${NC}  ${DIM}(${words}w)${NC}"
+    echo -e "${WHITE}${content}${NC}"
+    echo ""
+done

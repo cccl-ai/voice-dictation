@@ -1,0 +1,21 @@
+[Unit]
+Description=Voice Dictation Daemon
+After=graphical-session.target default.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dictate-daemon
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StandardError=journal
+StandardOutput=journal
+Environment="DISPLAY=:0"
+Environment="WAYLAND_DISPLAY=wayland-0"
+Environment="YDOTOOL_SOCKET=/run/user/%U/.ydotool_socket"
+PassEnvironment=XAUTHORITY
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,55 @@
+#!/bin/bash
+# Reprocess recent voice dictation recordings
+# Usage: dt reprocess [N] — reprocess last N recordings (default: 1)
+
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    echo "Usage: dt reprocess [N]"
+    echo "Reprocess last N recordings (default: 1)"
+    exit 0
+fi
+
+DICTATION_HISTORY_DIR="$HOME/.local/share/dictation-history"
+GROQ_API_KEY=$(cat "$HOME/.config/groq/api_key" 2>/dev/null)
+GROQ_MODEL="whisper-large-v3"
+GROQ_PROMPT_FILE="$HOME/.config/groq/prompt_hints"
+
+if [ -z "$GROQ_API_KEY" ]; then
+    echo "Error: No Groq API key found at ~/.config/groq/api_key"
+    exit 1
+fi
+
+COUNT="${1:-1}"
+
+transcribe() {
+    local audio_file="$1"
+    PROMPT_HINT=$(cat "$GROQ_PROMPT_FILE" 2>/dev/null)
+    CURL_ARGS=(-s https://api.groq.com/openai/v1/audio/transcriptions \
+        -H "Authorization: Bearer $GROQ_API_KEY" \
+        -F file="@$audio_file" \
+        -F model="$GROQ_MODEL" \
+        -F response_format="text" \
+        -F language="en")
+    [ -n "$PROMPT_HINT" ] && CURL_ARGS+=(-F "prompt=$PROMPT_HINT")
+    curl "${CURL_ARGS[@]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Get last N wav files sorted newest first
+mapfile -t wavs < <(ls -t "$DICTATION_HISTORY_DIR"/*.wav 2>/dev/null | head -"$COUNT")
+
+if [ ${#wavs[@]} -eq 0 ]; then
+    echo "No recordings found."
+    exit 1
+fi
+
+for wav in "${wavs[@]}"; do
+    name=$(basename "$wav")
+    txt="${wav%.wav}.txt"
+    echo "Processing: $name"
+    TEXT=$(transcribe "$wav")
+    if [ -n "$TEXT" ] && ! echo "$TEXT" | grep -qi '"error"'; then
+        echo "$TEXT" > "$txt"
+        echo "  -> $TEXT"
+    else
+        echo "  !! Transcription failed: $TEXT"
+    fi
+done

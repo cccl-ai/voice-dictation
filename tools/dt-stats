@@ -1,0 +1,35 @@
+#!/bin/bash
+# Show dictation history statistics
+# Usage: dt stats [--daily]
+
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    echo "Usage: dt stats [--daily]"
+    echo "Show dictation history statistics"
+    exit 0
+fi
+
+DICTATION_HISTORY_DIR="$HOME/.local/share/dictation-history"
+
+wav_count=$(ls "$DICTATION_HISTORY_DIR"/*.wav 2>/dev/null | wc -l)
+txt_count=$(ls "$DICTATION_HISTORY_DIR"/*.txt 2>/dev/null | wc -l)
+failed=$(grep -rli '"error"' "$DICTATION_HISTORY_DIR"/*.txt 2>/dev/null | wc -l)
+total_size=$(du -sh "$DICTATION_HISTORY_DIR" 2>/dev/null | cut -f1)
+total_words=$(cat "$DICTATION_HISTORY_DIR"/*.txt 2>/dev/null | grep -v '"error"' | wc -w)
+
+echo "Dictation History Stats"
+echo "======================="
+echo "  Recordings:    $wav_count"
+echo "  Transcripts:   $txt_count"
+echo "  Failed:        $failed"
+echo "  Total words:   $total_words"
+echo "  Disk usage:    $total_size"
+
+if [ "$1" = "--daily" ]; then
+    echo ""
+    echo "Per day:"
+    for day in $(ls "$DICTATION_HISTORY_DIR"/*.wav 2>/dev/null | xargs -n1 basename | cut -d_ -f1 | sort -u); do
+        day_count=$(ls "$DICTATION_HISTORY_DIR"/${day}_*.wav 2>/dev/null | wc -l)
+        day_words=$(cat "$DICTATION_HISTORY_DIR"/${day}_*.txt 2>/dev/null | grep -v '"error"' | wc -w)
+        printf "  %s  %3d recordings  %5d words\n" "$day" "$day_count" "$day_words"
+    done
+fi

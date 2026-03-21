@@ -1,0 +1,126 @@
+#!/bin/bash
+# Dictation daemon for macOS
+# Runs in background, watches for control signals from Hammerspoon
+# Uses whisper.cpp with Metal GPU acceleration for transcription
+
+CONTROL_FILE="/tmp/dictation_control"
+RECORDING_FILE="/tmp/dictation_recording.wav"
+PID_FILE="/tmp/dictation.pid"
+DAEMON_PID="/tmp/dictation_daemon.pid"
+
+# Exit if already running
+if [ -f "$DAEMON_PID" ] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
+    echo "Daemon already running (PID: $(cat "$DAEMON_PID"))" >&2
+    exit 0
+fi
+
+# Transcription backend: "groq" or "local"
+TRANSCRIPTION_BACKEND="${TRANSCRIPTION_BACKEND:-$(cat "$HOME/.config/dictation/backend" 2>/dev/null)}"
+TRANSCRIPTION_BACKEND="${TRANSCRIPTION_BACKEND:-local}"
+
+# Local whisper config
+WHISPER_MODEL="$HOME/tools/whisper-models/ggml-base.bin"
+WHISPER_CLI="whisper-cli"  # Installed via brew
+
+# Groq cloud config
+GROQ_API_KEY=$(cat "$HOME/.config/groq/api_key" 2>/dev/null)
+GROQ_MODEL="whisper-large-v3"
+GROQ_PROMPT_FILE="$HOME/.config/groq/prompt_hints"
+
+# Audio feedback sounds
+START_SOUND="/System/Library/Sounds/Tink.aiff"
+DONE_SOUND="/System/Library/Sounds/Pop.aiff"
+
+# Save daemon PID
+echo $$ > "$DAEMON_PID"
+
+log() {
+    echo "[$(date +'%H:%M:%S')] $1" >&2
+}
+
+transcribe() {
+    local audio_file="$1"
+    if [ "$TRANSCRIPTION_BACKEND" = "local" ]; then
+        PROMPT_HINT=$(cat "$GROQ_PROMPT_FILE" 2>/dev/null)
+        LOCAL_ARGS=(-m "$WHISPER_MODEL" -f "$audio_file" --no-timestamps -nt)
+        [ -n "$PROMPT_HINT" ] && LOCAL_ARGS+=(--prompt "$PROMPT_HINT")
+        "$WHISPER_CLI" "${LOCAL_ARGS[@]}" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    else
+        PROMPT_HINT=$(cat "$GROQ_PROMPT_FILE" 2>/dev/null)
+        CURL_ARGS=(-s https://api.groq.com/openai/v1/audio/transcriptions \
+            -H "Authorization: Bearer $GROQ_API_KEY" \
+            -F file="@$audio_file" \
+            -F model="$GROQ_MODEL" \
+            -F response_format="text" \
+            -F language="en")
+        [ -n "$PROMPT_HINT" ] && CURL_ARGS+=(-F "prompt=$PROMPT_HINT")
+        curl "${CURL_ARGS[@]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    fi
+}
+
+log "Dictation daemon started (PID: $$)"
+log "Transcription backend: $TRANSCRIPTION_BACKEND"
+log "Hotkeys: Caps Lock (tap=toggle, hold=push-to-talk) or Ctrl+Shift+Space"
+
+cleanup() {
+    rm -f "$CONTROL_FILE" "$PID_FILE" "$DAEMON_PID" "$RECORDING_FILE"
+    if [ -f "$PID_FILE" ]; then
+        kill $(cat "$PID_FILE") 2>/dev/null
+    fi
+    log "Daemon stopped"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+while true; do
+    if [ -f "$CONTROL_FILE" ]; then
+        ACTION=$(cat "$CONTROL_FILE")
+        rm -f "$CONTROL_FILE"
+
+        if [ "$ACTION" = "start" ] && [ ! -f "$PID_FILE" ]; then
+            # Start recording with sox
+            rec -q -c 1 "$RECORDING_FILE" &
+            echo $! > "$PID_FILE"
+            afplay "$START_SOUND" &
+            log "Recording started"
+
+        elif [ "$ACTION" = "stop" ] && [ -f "$PID_FILE" ]; then
+            # Stop recording
+            kill $(cat "$PID_FILE") 2>/dev/null
+            rm -f "$PID_FILE"
+            sleep 0.3
+
+            # Transcribe
+            if [ -f "$RECORDING_FILE" ]; then
+                # Check audio energy - skip if silence
+                RMS=$(sox "$RECORDING_FILE" -n stat 2>&1 | grep "RMS     amplitude" | awk '{print $3}')
+                if [ -n "$RMS" ] && [ "$(echo "$RMS < 0.001" | bc -l)" = "1" ]; then
+                    log "Audio too quiet (RMS: $RMS), skipping transcription"
+                    rm -f "$RECORDING_FILE"
+                else
+                    log "Transcribing via $TRANSCRIPTION_BACKEND..."
+                    TEXT=$(transcribe "$RECORDING_FILE")
+
+                    if [ -n "$TEXT" ]; then
+                        log "Transcribed: $TEXT"
+                        # Save current clipboard, paste text, restore clipboard
+                        OLD_CLIPBOARD=$(pbpaste 2>/dev/null)
+                        echo -n "$TEXT" | pbcopy
+                        osascript -e 'tell application "System Events" to keystroke "v" using command down'
+                        sleep 0.2
+                        echo -n "$OLD_CLIPBOARD" | pbcopy
+                        afplay "$DONE_SOUND" &
+                        log "Typing complete"
+                    else
+                        log "No speech detected"
+                    fi
+
+                    rm -f "$RECORDING_FILE"
+                fi
+            fi
+        fi
+    fi
+
+    sleep 0.1
+done

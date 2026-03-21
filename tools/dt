@@ -1,0 +1,40 @@
+#!/bin/bash
+# dt — dictation tools
+# Usage: dt <command> [args...]
+# Commands are discovered automatically from dt-* scripts in this directory.
+
+TOOLS_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+if [ -z "$1" ] || [ "$1" = "help" ]; then
+    echo "dt — dictation tools"
+    echo ""
+    echo "Utilities for working with voice dictation recordings"
+    echo "and transcripts in ~/.local/share/dictation-history/"
+    echo ""
+    echo "Usage: dt <command> [args...]"
+    echo ""
+    echo "Commands:"
+    for cmd in "$TOOLS_DIR"/dt-*; do
+        [ -f "$cmd" ] || continue
+        name=$(basename "$cmd" | sed 's/^dt-//')
+        desc=$(sed -n '2s/^# *//p' "$cmd")
+        usage=$(sed -n '3s/^# *Usage: *//p' "$cmd")
+        printf "  %-12s %s\n" "$name" "$desc"
+        [ -n "$usage" ] && printf "  %-12s usage: %s\n" "" "$usage"
+    done
+    echo ""
+    echo "Run 'dt <command> --help' for more details on a command."
+    exit 0
+fi
+
+CMD="$1"
+shift
+SCRIPT="$TOOLS_DIR/dt-$CMD"
+
+if [ ! -x "$SCRIPT" ]; then
+    echo "Unknown command: $CMD"
+    echo "Run 'dt help' for available commands."
+    exit 1
+fi
+
+exec "$SCRIPT" "$@"
