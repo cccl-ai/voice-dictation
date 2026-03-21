@@ -95,8 +95,8 @@ sed -e '/^    setup_backend$/d' \
     -e 's/systemctl --user daemon-reload/systemctl --user daemon-reload 2>\/dev\/null || true/' \
     -e 's/systemctl --user enable dictation/systemctl --user enable dictation/; s/dictation-listener$/dictation-listener 2>\/dev\/null || true/' \
     -e 's/systemctl --user restart dictation/systemctl --user restart dictation/; s/dictation-listener$/dictation-listener 2>\/dev\/null || true/' \
-    install.sh > /tmp/install-patched.sh
-chmod +x /tmp/install-patched.sh
+    install.sh > ~/voice-dictation/install-patched.sh
+chmod +x ~/voice-dictation/install-patched.sh
 
 # Ensure XDG_RUNTIME_DIR is set for systemd --user
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
@@ -107,7 +107,7 @@ if command -v dbus-launch &>/dev/null; then
     eval "$(dbus-launch --sh-syntax)" 2>/dev/null || true
 fi
 
-bash /tmp/install-patched.sh
+cd ~/voice-dictation && bash install-patched.sh
 CIEOF
 
 $LXC file push /tmp/voice-dictation-ci-install.sh "$CONTAINER/home/testuser/ci-install.sh"
